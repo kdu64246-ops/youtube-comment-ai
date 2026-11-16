@@ -1,0 +1,8 @@
+streamlit>=1.61
+google-api-python-client
+pandas
+numpy
+scikit-learn
+sentence-transformers
+transformers
+torch
