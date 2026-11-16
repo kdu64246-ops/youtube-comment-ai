@@ -1,9 +1,9 @@
 import os
 import re
 import json
+import gc
 import hashlib
 from collections import Counter
-from functools import lru_cache
 from urllib.parse import urlparse, parse_qs
 
 import numpy as np
@@ -33,17 +33,57 @@ SEMANTIC_SIM = 0.85
 CLUSTER_EPS = 0.18
 CLUSTER_MIN_SAMPLES = 5
 
-USE_SENTIMENT = True
-SENTIMENT_MODEL = "cringepnh/koelectra-korean-sentiment"
-SENT_SAMPLE = 3000
+# ============================ KOTE 44감정 분석 ============================
+# KOTE 공식 GitHub에서 배포한 Hugging Face Trainer 버전.
+# KcELECTRA-base를 KOTE 44개 멀티라벨 감정으로 파인튜닝한 체크포인트.
+KOTE_MODEL = "searle-j/kote_for_easygoing_people"
 
-CACHE_VERSION = "web_v1"
+# 공개 모델 예제에서 score > 0.4를 감정 라벨 채택 기준으로 사용.
+KOTE_THRESHOLD = 0.40
+
+# 웹 배포 환경의 메모리/속도를 고려해 표본 분석.
+# 분석 화면에 실제 사용 표본 수를 함께 표시한다.
+KOTE_SAMPLE = 1500
+KOTE_BATCH_SIZE = 32
+
+CACHE_VERSION = "web_kote44_v1"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
+# KOTE의 44개 라벨. 모델 config의 id2label을 우선 사용하고,
+# 안전한 폴백 및 표시 순서 확인용으로 명시한다.
+KOTE_LABELS = [
+    "불평/불만", "환영/호의", "감동/감탄", "지긋지긋", "고마움", "슬픔",
+    "화남/분노", "존경", "기대감", "우쭐댐/무시함", "안타까움/실망", "비장함",
+    "의심/불신", "뿌듯함", "편안/쾌적", "신기함/관심", "아껴주는", "부끄러움",
+    "공포/무서움", "절망", "한심함", "역겨움/징그러움", "짜증", "어이없음",
+    "없음", "패배/자기혐오", "귀찮음", "힘듦/지침", "즐거움/신남", "깨달음",
+    "죄책감", "증오/혐오", "흐뭇함(귀여움/예쁨)", "당황/난처", "경악",
+    "부담/안_내킴", "서러움", "재미없음", "불쌍함/연민", "놀람", "행복",
+    "불안/걱정", "기쁨", "안심/신뢰",
+]
+
+# KOTE 논문 Figure 2의 valence 색상 분류를 프로젝트의 3분류 요약에 사용.
+# '없음(NO EMOTION)'은 중립에 포함한다.
+NEGATIVE_EMOTIONS = {
+    "지긋지긋", "경악", "역겨움/징그러움", "증오/혐오", "화남/분노", "짜증",
+    "불평/불만", "어이없음", "한심함", "의심/불신", "안타까움/실망",
+    "당황/난처", "부끄러움", "죄책감", "패배/자기혐오", "공포/무서움",
+    "불안/걱정", "불쌍함/연민", "슬픔", "서러움", "절망", "힘듦/지침",
+    "귀찮음", "부담/안_내킴", "재미없음",
+}
+
+NEUTRAL_EMOTIONS = {
+    "우쭐댐/무시함", "비장함", "없음", "깨달음", "놀람", "존경", "신기함/관심",
+}
+
+POSITIVE_EMOTIONS = {
+    "기대감", "환영/호의", "아껴주는", "흐뭇함(귀여움/예쁨)", "즐거움/신남",
+    "기쁨", "행복", "감동/감탄", "뿌듯함", "고마움", "안심/신뢰", "편안/쾌적",
+}
+
 
 def extract_video_id(url_or_id):
-    """유튜브 주소 또는 11자리 영상 ID에서 영상 ID를 추출."""
     s = str(url_or_id).strip()
     if _ID_RE.match(s):
         return s
@@ -245,15 +285,6 @@ def tfidf_duplicate_metrics(df):
     }
 
 
-@lru_cache(maxsize=1)
-def _load_embedder():
-    import torch
-    from sentence_transformers import SentenceTransformer
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    return SentenceTransformer(EMBED_MODEL, device=device)
-
-
 def semantic_ai_metrics(df):
     empty = {
         "semantic_near_share": np.nan,
@@ -266,7 +297,11 @@ def semantic_ai_metrics(df):
     if not USE_SEMANTIC_AI or len(df) < 2:
         return empty
 
-    model = _load_embedder()
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(EMBED_MODEL, device=device)
 
     sample = df.sample(
         min(SEMANTIC_SAMPLE, len(df)),
@@ -328,6 +363,12 @@ def semantic_ai_metrics(df):
             "examples": examples,
         })
 
+    # 다음 KOTE 모델을 위해 임베딩 모델 메모리 해제
+    del model, emb, sim
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return {
         "semantic_near_share": semantic_near_share,
         "semantic_cluster_count": len(cluster_ids),
@@ -353,65 +394,185 @@ def author_metrics(df):
     }
 
 
-def _positive_label(label):
-    l = str(label).strip().lower()
-
-    if "positive" in l or "pos" in l or "긍정" in l:
-        return 1
-    if "negative" in l or "neg" in l or "부정" in l:
-        return 0
-    if l in {"label_1", "1"}:
-        return 1
-    if l in {"label_0", "0"}:
-        return 0
-
-    return None
+def _normalize_kote_label(label):
+    """모델/논문 표기 차이를 통일."""
+    label = str(label)
+    aliases = {
+        "NO EMOTION": "없음",
+        "정서 없음": "없음",
+        "부담/안 내킴": "부담/안_내킴",
+    }
+    return aliases.get(label, label)
 
 
-@lru_cache(maxsize=1)
-def _load_sentiment_model():
+def _valence_group(label):
+    label = _normalize_kote_label(label)
+    if label in NEGATIVE_EMOTIONS:
+        return "부정"
+    if label in POSITIVE_EMOTIONS:
+        return "긍정"
+    return "중립"
+
+
+def kote_emotion_metrics(df):
+    """
+    KOTE 44개 감정을 멀티라벨로 분석한다.
+    - sigmoid 확률 사용
+    - KOTE_THRESHOLD 이상인 감정을 해당 댓글의 감정으로 채택
+    - 세부 감정 비율은 멀티라벨이므로 합계가 100%를 넘을 수 있음
+    - 긍/부정/중립 요약은 댓글마다 각 그룹의 '가장 강한 감정 확률'을 비교해 1개로 분류
+    """
     import torch
-    from transformers import pipeline
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-    device = 0 if torch.cuda.is_available() else -1
-    return pipeline(
-        "text-classification",
-        model=SENTIMENT_MODEL,
-        device=device
+    if df.empty:
+        return {
+            "sample_size": 0,
+            "threshold": KOTE_THRESHOLD,
+            "emotion_distribution": [],
+            "valence_distribution": {"긍정": 0.0, "부정": 0.0, "중립": 0.0},
+            "top_emotion_examples": {},
+        }
+
+    sample = df.sample(
+        min(KOTE_SAMPLE, len(df)),
+        random_state=0
+    ).copy()
+
+    texts = sample["text"].astype(str).str[:500].tolist()
+
+    tokenizer = AutoTokenizer.from_pretrained(KOTE_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(KOTE_MODEL)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    # 모델 config의 실제 라벨 순서를 사용
+    id2label = {
+        int(k): _normalize_kote_label(v)
+        for k, v in model.config.id2label.items()
+    }
+    labels = [id2label[i] for i in range(len(id2label))]
+
+    if len(labels) != 44:
+        raise ValueError(
+            f"KOTE 모델 라벨 수가 44개가 아닙니다: {len(labels)}개"
+        )
+
+    all_probs = []
+
+    with torch.no_grad():
+        for start in range(0, len(texts), KOTE_BATCH_SIZE):
+            batch_texts = texts[start:start + KOTE_BATCH_SIZE]
+
+            enc = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+
+            logits = model(**enc).logits
+
+            # KOTE는 multi-label이므로 softmax가 아니라 sigmoid
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+
+    probs = np.vstack(all_probs)
+
+    # -------- 44개 세부 감정 집계 --------
+    detected = probs >= KOTE_THRESHOLD
+
+    emotion_distribution = []
+    for i, label in enumerate(labels):
+        count = int(detected[:, i].sum())
+        emotion_distribution.append({
+            "감정": label,
+            "댓글 수": count,
+            "비율": float(count / len(sample)),
+            "평균 확률": float(probs[:, i].mean()),
+            "분류": _valence_group(label),
+        })
+
+    emotion_distribution.sort(
+        key=lambda x: (x["댓글 수"], x["평균 확률"]),
+        reverse=True
     )
 
+    # -------- 댓글별 긍정/부정/중립 1개 요약 --------
+    label_to_idx = {label: i for i, label in enumerate(labels)}
+    neg_idx = [label_to_idx[x] for x in NEGATIVE_EMOTIONS if x in label_to_idx]
+    pos_idx = [label_to_idx[x] for x in POSITIVE_EMOTIONS if x in label_to_idx]
+    neu_idx = [label_to_idx[x] for x in NEUTRAL_EMOTIONS if x in label_to_idx]
 
-def sentiment_metrics(df):
-    if not USE_SENTIMENT or df.empty:
-        return {"positive": np.nan}
+    # 각 그룹에서 가장 강한 감정의 확률을 그 그룹 점수로 사용
+    neg_score = probs[:, neg_idx].max(axis=1) if neg_idx else np.zeros(len(sample))
+    pos_score = probs[:, pos_idx].max(axis=1) if pos_idx else np.zeros(len(sample))
+    neu_score = probs[:, neu_idx].max(axis=1) if neu_idx else np.zeros(len(sample))
 
-    clf = _load_sentiment_model()
+    group_scores = np.stack([pos_score, neg_score, neu_score], axis=1)
+    group_names = np.array(["긍정", "부정", "중립"])
 
-    s = df.sample(min(SENT_SAMPLE, len(df)), random_state=0)
+    winners = group_scores.argmax(axis=1)
+    max_scores = group_scores.max(axis=1)
 
-    res = clf(
-        s["text"].astype(str).str[:200].tolist(),
-        batch_size=64,
-        truncation=True,
-    )
+    # 어느 그룹도 임계값을 넘지 못하면 중립으로 처리
+    valence_labels = group_names[winners]
+    valence_labels[max_scores < KOTE_THRESHOLD] = "중립"
 
-    parsed = [_positive_label(r["label"]) for r in res]
-    parsed = [x for x in parsed if x is not None]
+    valence_counts = Counter(valence_labels.tolist())
+    valence_distribution = {
+        name: float(valence_counts.get(name, 0) / len(sample))
+        for name in ["긍정", "부정", "중립"]
+    }
+
+    # -------- 상위 감정별 대표 댓글 --------
+    top_emotion_examples = {}
+    for item in emotion_distribution[:8]:
+        label = item["감정"]
+        i = label_to_idx[label]
+
+        # 해당 감정이 임계값을 넘은 댓글 중 확률 상위 3개
+        idxs = np.where(probs[:, i] >= KOTE_THRESHOLD)[0]
+        if len(idxs) == 0:
+            continue
+
+        order = idxs[np.argsort(probs[idxs, i])[::-1][:3]]
+        top_emotion_examples[label] = [
+            {
+                "text": str(sample.iloc[j]["text"])[:220],
+                "score": float(probs[j, i]),
+            }
+            for j in order
+        ]
+
+    # 메모리 해제
+    del model, tokenizer, probs, all_probs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
-        "positive": float(np.mean(parsed)) if parsed else np.nan
+        "sample_size": len(sample),
+        "threshold": KOTE_THRESHOLD,
+        "emotion_distribution": emotion_distribution,
+        "valence_distribution": valence_distribution,
+        "top_emotion_examples": top_emotion_examples,
     }
 
 
 def simulation_signals(metrics):
     """
-    발표/시뮬레이션용 탐색 신호.
-    실제 댓글부대 존재를 증명하는 기준이 아님.
+    현재 프로젝트의 기존 이상 패턴 탐색 기준.
+    감정은 조직성 점수에 직접 포함하지 않고 별도 보조 정보로 보여준다.
     """
     signals = []
 
     if metrics["respike_days"] >= 1:
-        signals.append("업로드 이후 비정상적인 댓글 재급증")
+        signals.append("업로드 이후 댓글 재급증")
 
     if metrics["tfidf_near_share"] >= 0.10:
         signals.append("문자 형태가 매우 비슷한 댓글 비율이 높음")
@@ -428,9 +589,8 @@ def simulation_signals(metrics):
     if metrics["heavy_author_share"] >= 0.10:
         signals.append("반복 작성자의 댓글 비중이 높음")
 
-    # 확정 판정이 아니라, 사람이 다시 확인할 필요가 있는 정도만 표시
     if len(signals) >= 3:
-        level = "여러 이상 신호 발견 — 추가 확인 필요"
+        level = "여러 이상 신호 발견"
     elif len(signals) >= 1:
         level = "일부 이상 신호 발견"
     else:
@@ -458,7 +618,9 @@ def analyze_video(url, api_key):
     dup = tfidf_duplicate_metrics(df)
     sem = semantic_ai_metrics(df)
     auth = author_metrics(df)
-    sent = sentiment_metrics(df)
+
+    # 기존 이진 감성분석 대신 KOTE 44개 세부 감정 분석
+    emotion = kote_emotion_metrics(df)
 
     metrics = {
         "share_48h": time["share_48h"],
@@ -471,7 +633,6 @@ def analyze_video(url, api_key):
         "largest_cluster_share": sem["largest_cluster_share"],
         "heavy_author_share": auth["heavy_author_share"],
         "top_author_share": auth["top_author_share"],
-        "positive": sent["positive"],
     }
 
     level, signals = simulation_signals(metrics)
@@ -495,4 +656,11 @@ def analyze_video(url, api_key):
         "daily": daily_df,
         "level": level,
         "signals": signals,
+
+        # 새 KOTE 결과
+        "emotion_sample_size": emotion["sample_size"],
+        "emotion_threshold": emotion["threshold"],
+        "emotion_distribution": emotion["emotion_distribution"],
+        "valence_distribution": emotion["valence_distribution"],
+        "top_emotion_examples": emotion["top_emotion_examples"],
     }
