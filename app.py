@@ -86,13 +86,46 @@ if analyze:
         c6.metric("최대 AI 군집", f"{m['largest_cluster_share']:.1%}")
         c7.metric("반복 작성자 댓글", f"{m['heavy_author_share']:.1%}")
 
-        st.subheader("이상 신호")
-        st.write(f"**{result['level']}**")
-        if result["signals"]:
-            for s in result["signals"]:
-                st.write(f"• {s}")
-        else:
-            st.write("현재 탐색 기준에서 두드러진 이상 신호가 발견되지 않았습니다.")
+        # ---------------- 120점 판정 ----------------
+        score = result["score_result"]
+
+        st.subheader("조직적 댓글 활동 판정")
+        s1, s2 = st.columns([1, 2])
+        s1.metric("조직적 활동 점수", f"{score['score']} / {score['max_score']}")
+        s2.markdown(f"### {score['verdict']}")
+        s2.caption(f"판정 등급: {score['grade']}")
+
+        st.progress(score["score"] / score["max_score"])
+
+        score_df = pd.DataFrame(
+            {
+                "항목": list(score["item_scores"].keys()),
+                "점수": list(score["item_scores"].values()),
+            }
+        ).set_index("항목")
+        st.bar_chart(score_df, y="점수", height=360)
+
+        with st.expander("항목별 판정 기준과 근거 보기", expanded=True):
+            criteria = pd.DataFrame([
+                ["댓글 재급증", "0일=0점 / 1일=10점 / 2일 이상=20점"],
+                ["AI 의미 유사 댓글", "<10%=0점 / 10~20%=10점 / ≥20%=20점"],
+                ["최대 AI 군집", "<3%=0점 / 3~7%=10점 / ≥7%=20점"],
+                ["반복 작성자 댓글", "<5%=0점 / 5~10%=10점 / ≥10%=20점"],
+                ["TF-IDF 유사 댓글", "<3%=0점 / 3~8%=10점 / ≥8%=20점"],
+                ["복합 신호", "시간·내용·작성자 이상이 동시에 발생하면 20점"],
+            ], columns=["판정 항목", "점수 기준"])
+            st.dataframe(criteria, use_container_width=True, hide_index=True)
+
+            if score["reasons"]:
+                st.markdown("**이번 영상의 주요 판정 근거**")
+                for r in score["reasons"]:
+                    st.write(f"• {r}")
+
+        st.caption(
+            "점수 구간: 0~29 정상 / 30~49 주의 / 50~69 조직적 활동 의심 / "
+            "70~120 조직적 활동 강하게 의심. "
+            "본 점수는 이 과제에서 정의한 댓글 패턴 판정 기준입니다."
+        )
 
         chart = pd.DataFrame({
             "지표": [

@@ -564,39 +564,119 @@ def kote_emotion_metrics(df):
     }
 
 
-def simulation_signals(metrics):
+
+def organizational_score(metrics):
     """
-    현재 프로젝트의 기존 이상 패턴 탐색 기준.
-    감정은 조직성 점수에 직접 포함하지 않고 별도 보조 정보로 보여준다.
+    과제용 '조직적 댓글 활동' 판정 점수 (총 120점).
+
+    5개 핵심 지표를 각각 0/10/20점으로 평가하고,
+    시간·내용·작성자 세 영역이 동시에 이상하면 복합 신호 20점을 추가한다.
+
+    ※ 이 점수는 본 프로젝트에서 정의한 운영 기준이다.
     """
-    signals = []
 
-    if metrics["respike_days"] >= 1:
-        signals.append("업로드 이후 댓글 재급증")
+    item_scores = {}
+    reasons = []
 
-    if metrics["tfidf_near_share"] >= 0.10:
-        signals.append("문자 형태가 매우 비슷한 댓글 비율이 높음")
-
-    if (
-        not np.isnan(metrics["semantic_near_share"])
-        and metrics["semantic_near_share"] >= 0.15
-    ):
-        signals.append("AI가 의미가 매우 비슷한 댓글을 다수 탐지")
-
-    if metrics["largest_cluster_share"] >= 0.05:
-        signals.append("특정 AI 의미 군집에 댓글이 집중")
-
-    if metrics["heavy_author_share"] >= 0.10:
-        signals.append("반복 작성자의 댓글 비중이 높음")
-
-    if len(signals) >= 3:
-        level = "여러 이상 신호 발견"
-    elif len(signals) >= 1:
-        level = "일부 이상 신호 발견"
+    # 1) 댓글 재급증: 0 / 10 / 20
+    respike_days = int(metrics["respike_days"])
+    if respike_days >= 2:
+        item_scores["댓글 재급증"] = 20
+        reasons.append(f"댓글 재급증이 {respike_days}일 발생")
+    elif respike_days == 1:
+        item_scores["댓글 재급증"] = 10
+        reasons.append("댓글 재급증이 1일 발생")
     else:
-        level = "두드러진 이상 신호가 적음"
+        item_scores["댓글 재급증"] = 0
 
-    return level, signals
+    # 2) AI 의미 유사 댓글: 0 / 10 / 20
+    sem = metrics["semantic_near_share"]
+    if not np.isnan(sem) and sem >= 0.20:
+        item_scores["AI 의미 유사 댓글"] = 20
+        reasons.append(f"AI 의미 유사 댓글 비율이 {sem:.1%}")
+    elif not np.isnan(sem) and sem >= 0.10:
+        item_scores["AI 의미 유사 댓글"] = 10
+        reasons.append(f"AI 의미 유사 댓글 비율이 {sem:.1%}")
+    else:
+        item_scores["AI 의미 유사 댓글"] = 0
+
+    # 3) 최대 AI 군집 비율: 0 / 10 / 20
+    cluster = metrics["largest_cluster_share"]
+    if cluster >= 0.07:
+        item_scores["최대 AI 군집"] = 20
+        reasons.append(f"가장 큰 AI 의미 군집이 전체 표본의 {cluster:.1%}")
+    elif cluster >= 0.03:
+        item_scores["최대 AI 군집"] = 10
+        reasons.append(f"가장 큰 AI 의미 군집이 전체 표본의 {cluster:.1%}")
+    else:
+        item_scores["최대 AI 군집"] = 0
+
+    # 4) 반복 작성자 댓글: 0 / 10 / 20
+    heavy = metrics["heavy_author_share"]
+    if heavy >= 0.10:
+        item_scores["반복 작성자"] = 20
+        reasons.append(f"반복 작성자 댓글 비율이 {heavy:.1%}")
+    elif heavy >= 0.05:
+        item_scores["반복 작성자"] = 10
+        reasons.append(f"반복 작성자 댓글 비율이 {heavy:.1%}")
+    else:
+        item_scores["반복 작성자"] = 0
+
+    # 5) TF-IDF 유사 댓글: 0 / 10 / 20
+    tfidf = metrics["tfidf_near_share"]
+    if tfidf >= 0.08:
+        item_scores["TF-IDF 유사 댓글"] = 20
+        reasons.append(f"문자 형태가 매우 비슷한 댓글 비율이 {tfidf:.1%}")
+    elif tfidf >= 0.03:
+        item_scores["TF-IDF 유사 댓글"] = 10
+        reasons.append(f"문자 형태가 매우 비슷한 댓글 비율이 {tfidf:.1%}")
+    else:
+        item_scores["TF-IDF 유사 댓글"] = 0
+
+    # 6) 복합 신호 20점
+    # 시간 / 내용 / 작성자 행동 세 영역이 동시에 기준을 넘으면 추가점수
+    time_abnormal = respike_days >= 1
+    content_abnormal = (
+        (not np.isnan(sem) and sem >= 0.15)
+        or cluster >= 0.05
+        or tfidf >= 0.08
+    )
+    author_abnormal = heavy >= 0.10
+
+    if time_abnormal and content_abnormal and author_abnormal:
+        item_scores["복합 신호"] = 20
+        reasons.append("시간·댓글 내용·작성자 행동의 이상 신호가 동시에 발생")
+    else:
+        item_scores["복합 신호"] = 0
+
+    total = int(sum(item_scores.values()))
+
+    if total >= 70:
+        verdict = "조직적 댓글 활동 강하게 의심"
+        grade = "고위험"
+    elif total >= 50:
+        verdict = "조직적 댓글 활동 의심"
+        grade = "의심"
+    elif total >= 30:
+        verdict = "일부 비정상 댓글 패턴 발견"
+        grade = "주의"
+    else:
+        verdict = "정상적인 댓글 패턴"
+        grade = "정상"
+
+    return {
+        "score": total,
+        "max_score": 120,
+        "grade": grade,
+        "verdict": verdict,
+        "item_scores": item_scores,
+        "reasons": reasons,
+        "domain_flags": {
+            "시간": time_abnormal,
+            "내용": content_abnormal,
+            "작성자": author_abnormal,
+        },
+    }
 
 
 def analyze_video(url, api_key):
@@ -635,7 +715,7 @@ def analyze_video(url, api_key):
         "top_author_share": auth["top_author_share"],
     }
 
-    level, signals = simulation_signals(metrics)
+    score_result = organizational_score(metrics)
 
     daily_df = pd.DataFrame({
         "날짜": time["daily"].index,
@@ -654,8 +734,7 @@ def analyze_video(url, api_key):
         "top_phrases": dup["top_phrases"],
         "top_clusters": sem["top_clusters"],
         "daily": daily_df,
-        "level": level,
-        "signals": signals,
+        "score_result": score_result,
 
         # 새 KOTE 결과
         "emotion_sample_size": emotion["sample_size"],
