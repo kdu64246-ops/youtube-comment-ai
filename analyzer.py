@@ -679,6 +679,441 @@ def organizational_score(metrics):
     }
 
 
+
+def _semantic_ai_metrics_with_model(df, model):
+    """이미 로드된 Ko-SRoBERTa 모델을 재사용해 한 영상의 의미 유사도/군집을 계산."""
+    empty = {
+        "semantic_near_share": np.nan,
+        "semantic_cluster_count": 0,
+        "largest_cluster_share": 0.0,
+        "clustered_share": 0.0,
+        "top_clusters": [],
+    }
+
+    if not USE_SEMANTIC_AI or len(df) < 2:
+        return empty
+
+    sample = df.sample(
+        min(SEMANTIC_SAMPLE, len(df)),
+        random_state=42
+    ).copy()
+
+    texts = sample["text"].astype(str).str[:300].tolist()
+
+    emb = model.encode(
+        texts,
+        batch_size=64,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    emb = np.asarray(emb, dtype=np.float32)
+
+    sim = emb @ emb.T
+    np.fill_diagonal(sim, -1.0)
+    max_sim = sim.max(axis=1)
+    semantic_near_share = float((max_sim >= SEMANTIC_SIM).mean())
+
+    labels = DBSCAN(
+        eps=CLUSTER_EPS,
+        min_samples=CLUSTER_MIN_SAMPLES,
+        metric="cosine",
+        n_jobs=-1,
+    ).fit_predict(emb)
+
+    clustered = labels != -1
+    cluster_ids = sorted(set(labels) - {-1})
+    cluster_sizes = Counter(labels[clustered]) if clustered.any() else Counter()
+    clustered_share = float(clustered.mean())
+
+    largest_cluster_share = (
+        max(cluster_sizes.values()) / len(sample)
+        if cluster_sizes else 0.0
+    )
+
+    top_clusters = []
+    for cid, size in cluster_sizes.most_common(5):
+        idxs = np.where(labels == cid)[0]
+        centroid = emb[idxs].mean(axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+        center_sim = emb[idxs] @ centroid
+        order = idxs[np.argsort(center_sim)[::-1][:5]]
+
+        top_clusters.append({
+            "cluster_id": int(cid),
+            "size": int(size),
+            "examples": [
+                str(sample.iloc[i]["text"])[:180]
+                for i in order
+            ],
+        })
+
+    # 영상별 큰 배열은 즉시 해제하고 모델만 유지
+    del emb, sim
+    gc.collect()
+
+    return {
+        "semantic_near_share": semantic_near_share,
+        "semantic_cluster_count": len(cluster_ids),
+        "largest_cluster_share": float(largest_cluster_share),
+        "clustered_share": clustered_share,
+        "top_clusters": top_clusters,
+    }
+
+
+def _kote_emotion_metrics_with_model(df, tokenizer, model, device):
+    """이미 로드된 KcELECTRA+KOTE 모델을 재사용해 한 영상의 44감정을 계산."""
+    import torch
+
+    if df.empty:
+        return {
+            "sample_size": 0,
+            "threshold": KOTE_THRESHOLD,
+            "emotion_distribution": [],
+            "valence_distribution": {"긍정": 0.0, "부정": 0.0, "중립": 0.0},
+            "top_emotion_examples": {},
+        }
+
+    sample = df.sample(
+        min(KOTE_SAMPLE, len(df)),
+        random_state=0
+    ).copy()
+
+    texts = sample["text"].astype(str).str[:500].tolist()
+
+    id2label = {
+        int(k): _normalize_kote_label(v)
+        for k, v in model.config.id2label.items()
+    }
+    labels = [id2label[i] for i in range(len(id2label))]
+
+    if len(labels) != 44:
+        raise ValueError(f"KOTE 모델 라벨 수가 44개가 아닙니다: {len(labels)}개")
+
+    all_probs = []
+
+    with torch.no_grad():
+        for start in range(0, len(texts), KOTE_BATCH_SIZE):
+            batch_texts = texts[start:start + KOTE_BATCH_SIZE]
+
+            enc = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+
+            logits = model(**enc).logits
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+
+    probs = np.vstack(all_probs)
+    detected = probs >= KOTE_THRESHOLD
+
+    emotion_distribution = []
+    for i, label in enumerate(labels):
+        count = int(detected[:, i].sum())
+        emotion_distribution.append({
+            "감정": label,
+            "댓글 수": count,
+            "비율": float(count / len(sample)),
+            "평균 확률": float(probs[:, i].mean()),
+            "분류": _valence_group(label),
+        })
+
+    emotion_distribution.sort(
+        key=lambda x: (x["댓글 수"], x["평균 확률"]),
+        reverse=True
+    )
+
+    label_to_idx = {label: i for i, label in enumerate(labels)}
+    neg_idx = [label_to_idx[x] for x in NEGATIVE_EMOTIONS if x in label_to_idx]
+    pos_idx = [label_to_idx[x] for x in POSITIVE_EMOTIONS if x in label_to_idx]
+    neu_idx = [label_to_idx[x] for x in NEUTRAL_EMOTIONS if x in label_to_idx]
+
+    neg_score = probs[:, neg_idx].max(axis=1) if neg_idx else np.zeros(len(sample))
+    pos_score = probs[:, pos_idx].max(axis=1) if pos_idx else np.zeros(len(sample))
+    neu_score = probs[:, neu_idx].max(axis=1) if neu_idx else np.zeros(len(sample))
+
+    group_scores = np.stack([pos_score, neg_score, neu_score], axis=1)
+    group_names = np.array(["긍정", "부정", "중립"])
+
+    winners = group_scores.argmax(axis=1)
+    max_scores = group_scores.max(axis=1)
+    valence_labels = group_names[winners]
+    valence_labels[max_scores < KOTE_THRESHOLD] = "중립"
+
+    valence_counts = Counter(valence_labels.tolist())
+    valence_distribution = {
+        name: float(valence_counts.get(name, 0) / len(sample))
+        for name in ["긍정", "부정", "중립"]
+    }
+
+    top_emotion_examples = {}
+    for item in emotion_distribution[:8]:
+        label = item["감정"]
+        i = label_to_idx[label]
+        idxs = np.where(probs[:, i] >= KOTE_THRESHOLD)[0]
+        if len(idxs) == 0:
+            continue
+
+        order = idxs[np.argsort(probs[idxs, i])[::-1][:3]]
+        top_emotion_examples[label] = [
+            {
+                "text": str(sample.iloc[j]["text"])[:220],
+                "score": float(probs[j, i]),
+            }
+            for j in order
+        ]
+
+    del probs, all_probs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return {
+        "sample_size": len(sample),
+        "threshold": KOTE_THRESHOLD,
+        "emotion_distribution": emotion_distribution,
+        "valence_distribution": valence_distribution,
+        "top_emotion_examples": top_emotion_examples,
+    }
+
+
+def _prepare_video_for_batch(youtube, url):
+    """AI 모델을 불러오기 전에 댓글 수집 + 일반 통계 분석을 끝낸다."""
+    video_id = extract_video_id(url)
+    info = fetch_video_info(youtube, video_id)
+    raw_df = fetch_comments(youtube, video_id)
+
+    if raw_df.empty:
+        raise ValueError("수집 가능한 댓글이 없습니다.")
+
+    df = filter_analysis_comments(raw_df)
+    if df.empty:
+        raise ValueError("분석 가능한 한국어 댓글이 없습니다.")
+
+    time = time_metrics(df, info["upload"])
+    dup = tfidf_duplicate_metrics(df)
+    auth = author_metrics(df)
+
+    return {
+        "url": url,
+        "video_id": video_id,
+        "info": info,
+        "raw_count": len(raw_df),
+        "df": df,
+        "time": time,
+        "dup": dup,
+        "auth": auth,
+    }
+
+
+def _finalize_batch_result(prep, sem, emotion):
+    info = prep["info"]
+    df = prep["df"]
+    time = prep["time"]
+    dup = prep["dup"]
+    auth = prep["auth"]
+
+    metrics = {
+        "share_48h": time["share_48h"],
+        "respike_days": len(time["respikes"]),
+        "exact_share": dup["exact_share"],
+        "tfidf_near_share": dup["tfidf_near_share"],
+        "semantic_near_share": sem["semantic_near_share"],
+        "semantic_cluster_count": sem["semantic_cluster_count"],
+        "clustered_share": sem["clustered_share"],
+        "largest_cluster_share": sem["largest_cluster_share"],
+        "heavy_author_share": auth["heavy_author_share"],
+        "top_author_share": auth["top_author_share"],
+    }
+
+    score_result = organizational_score(metrics)
+
+    daily_df = pd.DataFrame({
+        "날짜": time["daily"].index,
+        "댓글 수": time["daily"].values,
+    })
+
+    return {
+        "video_id": prep["video_id"],
+        "title": info["title"],
+        "upload": info["upload"],
+        "view_count": info["view_count"],
+        "reported_comments": info["reported_comments"],
+        "collected_comments": prep["raw_count"],
+        "analyzed_comments": len(df),
+        "metrics": metrics,
+        "top_phrases": dup["top_phrases"],
+        "top_clusters": sem["top_clusters"],
+        "daily": daily_df,
+        "score_result": score_result,
+        "emotion_sample_size": emotion["sample_size"],
+        "emotion_threshold": emotion["threshold"],
+        "emotion_distribution": emotion["emotion_distribution"],
+        "valence_distribution": emotion["valence_distribution"],
+        "top_emotion_examples": emotion["top_emotion_examples"],
+    }
+
+
+def analyze_videos_batch(urls, api_key, progress_callback=None):
+    """
+    여러 영상을 한 번에 분석한다.
+
+    처리 순서
+    1) 모든 영상 댓글 수집 + 일반 통계
+    2) Ko-SRoBERTa 모델 1회 로드 → 모든 영상 의미 분석 → 모델 해제
+    3) KcELECTRA+KOTE 모델 1회 로드 → 모든 영상 감정 분석 → 모델 해제
+    4) 영상별 120점 계산
+
+    반환:
+      {"results": [...], "errors": [...]}
+    """
+    import torch
+    from sentence_transformers import SentenceTransformer
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+    clean_urls = []
+    seen = set()
+    for url in urls:
+        s = str(url).strip()
+        if not s:
+            continue
+        try:
+            vid = extract_video_id(s)
+        except Exception:
+            # 실제 오류 메시지는 준비 단계에서 기록
+            vid = s
+        if vid in seen:
+            continue
+        seen.add(vid)
+        clean_urls.append(s)
+
+    if not clean_urls:
+        return {"results": [], "errors": []}
+
+    total_steps = len(clean_urls) * 3 + 2
+    done = 0
+
+    def report(message):
+        nonlocal done
+        if progress_callback:
+            progress_callback(done, total_steps, message)
+
+    youtube = get_youtube(api_key)
+
+    prepared = []
+    errors = []
+
+    # 1) 댓글 수집 + 일반 분석
+    for idx, url in enumerate(clean_urls, 1):
+        report(f"[1/3] {idx}/{len(clean_urls)} 영상 댓글 수집 및 기본 분석")
+        try:
+            prepared.append(_prepare_video_for_batch(youtube, url))
+        except Exception as e:
+            errors.append({
+                "url": url,
+                "stage": "댓글 수집/기본 분석",
+                "error": str(e),
+            })
+        done += 1
+
+    if not prepared:
+        report("분석 가능한 영상이 없습니다.")
+        return {"results": [], "errors": errors}
+
+    # 2) Ko-SRoBERTa는 한 번만 로드
+    report("[2/3] Ko-SRoBERTa AI 모델을 한 번만 로드하는 중")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    semantic_model = SentenceTransformer(EMBED_MODEL, device=device)
+    done += 1
+
+    semantic_results = {}
+    semantic_ok = []
+
+    for idx, prep in enumerate(prepared, 1):
+        report(f"[2/3] {idx}/{len(prepared)} 영상 의미 유사도·군집 분석")
+        try:
+            semantic_results[prep["video_id"]] = _semantic_ai_metrics_with_model(
+                prep["df"], semantic_model
+            )
+            semantic_ok.append(prep)
+        except Exception as e:
+            errors.append({
+                "url": prep["url"],
+                "video_id": prep["video_id"],
+                "stage": "Ko-SRoBERTa 의미 분석",
+                "error": str(e),
+            })
+        done += 1
+
+    del semantic_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if not semantic_ok:
+        report("Ko-SRoBERTa 분석을 완료한 영상이 없습니다.")
+        return {"results": [], "errors": errors}
+
+    # 3) KOTE도 한 번만 로드
+    report("[3/3] KcELECTRA + KOTE AI 모델을 한 번만 로드하는 중")
+    tokenizer = AutoTokenizer.from_pretrained(KOTE_MODEL)
+    kote_model = AutoModelForSequenceClassification.from_pretrained(KOTE_MODEL)
+    kote_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    kote_model.to(kote_device)
+    kote_model.eval()
+    done += 1
+
+    results = []
+
+    empty_emotion = {
+        "sample_size": 0,
+        "threshold": KOTE_THRESHOLD,
+        "emotion_distribution": [],
+        "valence_distribution": {"긍정": 0.0, "부정": 0.0, "중립": 0.0},
+        "top_emotion_examples": {},
+    }
+
+    for idx, prep in enumerate(semantic_ok, 1):
+        report(f"[3/3] {idx}/{len(semantic_ok)} 영상 KOTE 44감정 분석 및 점수 계산")
+        try:
+            emotion = _kote_emotion_metrics_with_model(
+                prep["df"], tokenizer, kote_model, kote_device
+            )
+        except Exception as e:
+            # 감정 분석은 최종 120점에 직접 들어가지 않으므로
+            # 감정만 비워두고 핵심 점수 결과는 유지한다.
+            emotion = empty_emotion.copy()
+            errors.append({
+                "url": prep["url"],
+                "video_id": prep["video_id"],
+                "stage": "KOTE 감정 분석",
+                "error": str(e),
+            })
+
+        result = _finalize_batch_result(
+            prep,
+            semantic_results[prep["video_id"]],
+            emotion,
+        )
+        results.append(result)
+        done += 1
+
+        # 결과를 만든 뒤 원문 데이터프레임은 배치 메모리에서 제거 가능
+        prep["df"] = None
+
+    del kote_model, tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    report("전체 영상 분석 완료")
+    return {"results": results, "errors": errors}
+
+
 def analyze_video(url, api_key):
     video_id = extract_video_id(url)
     youtube = get_youtube(api_key)

@@ -6,8 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from analyzer import analyze_video
-
+from analyzer import analyze_videos_batch
 
 def _pct(value):
     """0~1 비율을 발표용 % 문자열로 변환."""
@@ -225,195 +224,179 @@ def build_ppt_result_zip(result):
     return buf.getvalue()
 
 
-st.set_page_config(
-    page_title="AI 유튜브 댓글 이상 패턴 분석",
-    page_icon="🔎",
-    layout="wide",
-)
 
-st.title("🔎 AI 유튜브 댓글 이상 패턴 분석")
-st.caption(
-    "YouTube 주소를 입력하면 댓글의 시간 집중, 반복성, AI 의미 유사도, "
-    "작성자 반복과 KOTE 기반 44개 세부 감정을 분석합니다."
-)
 
-api_key = ""
-try:
-    api_key = st.secrets.get("YOUTUBE_API_KEY", "")
-except Exception:
-    pass
+MAX_BATCH_VIDEOS = 10
 
-api_key = api_key or os.environ.get("YOUTUBE_API_KEY", "")
 
-if not api_key:
-    with st.sidebar:
-        st.subheader("YouTube API 설정")
-        api_key = st.text_input(
-            "YouTube API Key",
-            type="password",
-            help="입력한 키는 화면에 표시되지 않습니다."
+def build_batch_result_zip(results, errors=None):
+    """여러 영상의 비교표와 각 영상 상세 결과를 하나의 ZIP으로 묶는다."""
+    errors = errors or []
+
+    comparison_rows = []
+    ai_rows = []
+    emotion_rows = []
+
+    for r in results:
+        m = r["metrics"]
+        s = r["score_result"]
+        vd = r["valence_distribution"]
+        top_emotion = (
+            r["emotion_distribution"][0]["감정"]
+            if r["emotion_distribution"] else "분석값 없음"
         )
 
-url = st.text_input(
-    "분석할 YouTube 영상 주소",
-    placeholder="https://www.youtube.com/watch?v=..."
-)
+        comparison_rows.append({
+            "영상 ID": r["video_id"],
+            "영상 제목": r["title"],
+            "수집 댓글": r["collected_comments"],
+            "분석 댓글": r["analyzed_comments"],
+            "최종 점수": s["score"],
+            "최대 점수": s["max_score"],
+            "등급": s["grade"],
+            "판정": s["verdict"],
+        })
 
-analyze = st.button(
-    "댓글 분석하기",
-    type="primary",
-    use_container_width=True
-)
+        ai_rows.append({
+            "영상 ID": r["video_id"],
+            "영상 제목": r["title"],
+            "48시간 댓글(%)": round(m["share_48h"] * 100, 2),
+            "댓글 재급증(일)": m["respike_days"],
+            "TF-IDF 유사댓글(%)": round(m["tfidf_near_share"] * 100, 2),
+            "Ko-SRoBERTa 의미유사(%)": (
+                round(m["semantic_near_share"] * 100, 2)
+                if not np.isnan(m["semantic_near_share"]) else np.nan
+            ),
+            "최대 AI 군집(%)": round(m["largest_cluster_share"] * 100, 2),
+            "반복 작성자 댓글(%)": round(m["heavy_author_share"] * 100, 2),
+        })
 
-if analyze:
-    if not api_key:
-        st.error("YouTube API Key를 먼저 입력하세요.")
-        st.stop()
+        emotion_rows.append({
+            "영상 ID": r["video_id"],
+            "영상 제목": r["title"],
+            "긍정(%)": round(vd["긍정"] * 100, 2),
+            "부정(%)": round(vd["부정"] * 100, 2),
+            "중립(%)": round(vd["중립"] * 100, 2),
+            "가장 많이 검출된 세부 감정": top_emotion,
+        })
 
-    if not url.strip():
-        st.error("YouTube 영상 주소를 입력하세요.")
-        st.stop()
+    comparison_df = pd.DataFrame(comparison_rows)
+    ai_df = pd.DataFrame(ai_rows)
+    emotion_df = pd.DataFrame(emotion_rows)
+    error_df = pd.DataFrame(errors)
 
-    try:
-        with st.spinner(
-            "댓글을 수집하고 AI가 분석하고 있습니다. "
-            "처음 실행할 때는 AI 모델 다운로드 때문에 시간이 더 걸릴 수 있습니다."
-        ):
-            result = analyze_video(url, api_key)
+    ranked = sorted(
+        results,
+        key=lambda x: x["score_result"]["score"],
+        reverse=True
+    )
+    comparison_text = "\n".join(
+        f"- {i}. {r['title']} : {r['score_result']['score']}/120 "
+        f"({r['score_result']['verdict']})"
+        for i, r in enumerate(ranked, 1)
+    )
 
-        st.success("분석이 완료되었습니다.")
+    ppt_summary = f"""[전체 영상 비교 분석 - PPT용 요약]
 
-        st.subheader(result["title"])
-        st.caption(
-            f"영상 ID: {result['video_id']} · "
-            f"수집 댓글 {result['collected_comments']:,}개 · "
-            f"한국어 분석 댓글 {result['analyzed_comments']:,}개"
-        )
+분석 영상 수: {len(results)}개
 
-        # ---------------- 기존 이상 패턴 지표 ----------------
-        m = result["metrics"]
+1. 영상별 120점 결과
+{comparison_text}
 
-        st.header("1. 댓글 이상 패턴 분석")
+2. 비교할 핵심 AI 분석
+- Ko-SRoBERTa 의미 유사 댓글 비율
+- Ko-SRoBERTa 임베딩 + DBSCAN 최대 의미 군집 비율
+- KcELECTRA + KOTE 긍정/부정/중립 및 44개 세부 감정
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("48시간 내 댓글", f"{m['share_48h']:.1%}")
-        c2.metric("댓글 재급증", f"{m['respike_days']}일")
-        c3.metric("AI 의미 유사 댓글", f"{m['semantic_near_share']:.1%}")
-        c4.metric("AI 의미 군집", f"{m['semantic_cluster_count']}개")
+3. 비교할 비-AI 분석
+- 댓글 재급증
+- TF-IDF 유사댓글
+- 반복 작성자 댓글
+- 업로드 후 48시간 댓글 비율(보조 지표)
 
-        c5, c6, c7 = st.columns(3)
-        c5.metric("TF-IDF 유사 댓글", f"{m['tfidf_near_share']:.1%}")
-        c6.metric("최대 AI 군집", f"{m['largest_cluster_share']:.1%}")
-        c7.metric("반복 작성자 댓글", f"{m['heavy_author_share']:.1%}")
+4. 발표 시 주의
+- 120점은 본 프로젝트에서 정의한 조직적 댓글 패턴 탐색 기준
+- 실제 조직적 조작 여부를 직접 증명하는 점수가 아니라,
+  동일한 기준으로 여러 영상을 비교하기 위한 운영 점수
+- KOTE 감정은 현재 120점에 직접 반영하지 않고 보조 분석으로 사용
+"""
 
-        # ---------------- 120점 판정 ----------------
-        score = result["score_result"]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("전체영상_점수비교.csv", _csv_bytes(comparison_df))
+        z.writestr("전체영상_AI지표비교.csv", _csv_bytes(ai_df))
+        z.writestr("전체영상_KOTE감정비교.csv", _csv_bytes(emotion_df))
+        if not error_df.empty:
+            z.writestr("분석오류목록.csv", _csv_bytes(error_df))
+        z.writestr("PPT_전체비교요약.txt", ppt_summary.encode("utf-8-sig"))
 
-        st.subheader("조직적 댓글 활동 판정")
-        s1, s2 = st.columns([1, 2])
-        s1.metric("조직적 활동 점수", f"{score['score']} / {score['max_score']}")
-        s2.markdown(f"### {score['verdict']}")
-        s2.caption(f"판정 등급: {score['grade']}")
+        # 기존 단일 영상용 ZIP의 파일들을 영상별 폴더에 풀어서 포함
+        for r in results:
+            single_zip = build_ppt_result_zip(r)
+            folder = f"{r['video_id']}_{re.sub(r'[^0-9A-Za-z가-힣_-]+', '_', r['title'])[:30]}"
+            with zipfile.ZipFile(io.BytesIO(single_zip), "r") as single:
+                for name in single.namelist():
+                    z.writestr(f"{folder}/{name}", single.read(name))
 
-        st.progress(score["score"] / score["max_score"])
+    return buf.getvalue()
 
-        score_df = pd.DataFrame(
-            {
-                "항목": list(score["item_scores"].keys()),
-                "점수": list(score["item_scores"].values()),
-            }
-        ).set_index("항목")
-        st.bar_chart(score_df, y="점수", height=360)
 
-        with st.expander("항목별 판정 기준과 근거 보기", expanded=True):
-            criteria = pd.DataFrame([
-                ["댓글 재급증", "0일=0점 / 1일=10점 / 2일 이상=20점"],
-                ["AI 의미 유사 댓글", "<10%=0점 / 10~20%=10점 / ≥20%=20점"],
-                ["최대 AI 군집", "<3%=0점 / 3~7%=10점 / ≥7%=20점"],
-                ["반복 작성자 댓글", "<5%=0점 / 5~10%=10점 / ≥10%=20점"],
-                ["TF-IDF 유사 댓글", "<3%=0점 / 3~8%=10점 / ≥8%=20점"],
-                ["복합 신호", "시간·내용·작성자 이상이 동시에 발생하면 20점"],
-            ], columns=["판정 항목", "점수 기준"])
-            st.dataframe(criteria, use_container_width=True, hide_index=True)
+def comparison_dataframe(results):
+    rows = []
+    for r in results:
+        m = r["metrics"]
+        s = r["score_result"]
+        vd = r["valence_distribution"]
+        rows.append({
+            "영상": r["title"],
+            "영상 ID": r["video_id"],
+            "댓글 수": r["collected_comments"],
+            "최종 점수": s["score"],
+            "등급": s["grade"],
+            "재급증(일)": m["respike_days"],
+            "TF-IDF(%)": round(m["tfidf_near_share"] * 100, 1),
+            "AI 의미유사(%)": (
+                round(m["semantic_near_share"] * 100, 1)
+                if not np.isnan(m["semantic_near_share"]) else np.nan
+            ),
+            "최대 AI 군집(%)": round(m["largest_cluster_share"] * 100, 1),
+            "반복작성자(%)": round(m["heavy_author_share"] * 100, 1),
+            "긍정(%)": round(vd["긍정"] * 100, 1),
+            "부정(%)": round(vd["부정"] * 100, 1),
+            "중립(%)": round(vd["중립"] * 100, 1),
+        })
+    return pd.DataFrame(rows)
 
-            if score["reasons"]:
-                st.markdown("**이번 영상의 주요 판정 근거**")
-                for r in score["reasons"]:
-                    st.write(f"• {r}")
 
-        st.caption(
-            "점수 구간: 0~29 정상 / 30~49 주의 / 50~69 조직적 활동 의심 / "
-            "70~120 조직적 활동 강하게 의심. "
-            "본 점수는 이 과제에서 정의한 댓글 패턴 판정 기준입니다."
-        )
+def render_video_detail(result):
+    m = result["metrics"]
+    score = result["score_result"]
+    vd = result["valence_distribution"]
 
-        chart = pd.DataFrame({
-            "지표": [
-                "48시간 댓글",
-                "TF-IDF 유사 댓글",
-                "AI 의미 유사 댓글",
-                "최대 AI 군집",
-                "반복 작성자 댓글",
-            ],
-            "비율(%)": [
-                m["share_48h"] * 100,
-                m["tfidf_near_share"] * 100,
-                m["semantic_near_share"] * 100,
-                m["largest_cluster_share"] * 100,
-                m["heavy_author_share"] * 100,
-            ]
-        }).set_index("지표")
-        st.bar_chart(chart, y="비율(%)", height=420)
+    st.markdown(f"### {result['title']}")
+    st.caption(
+        f"영상 ID: {result['video_id']} · "
+        f"수집 {result['collected_comments']:,}개 · "
+        f"분석 {result['analyzed_comments']:,}개"
+    )
 
-        st.subheader("날짜별 댓글 수")
-        daily = result["daily"].set_index("날짜")
-        st.line_chart(daily, y="댓글 수", height=330)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("최종 점수", f"{score['score']} / 120")
+    c2.metric("AI 의미 유사", _pct(m["semantic_near_share"]))
+    c3.metric("최대 AI 군집", _pct(m["largest_cluster_share"]))
+    c4.metric("반복 작성자", _pct(m["heavy_author_share"]))
 
-        # ---------------- KOTE 세부 감정 ----------------
-        st.divider()
-        st.header("2. KOTE 기반 44개 세부 감정 분석")
+    st.markdown(f"**판정:** {score['verdict']}")
 
-        st.caption(
-            f"KcELECTRA + KOTE 44감정 멀티라벨 모델 사용 · "
-            f"표본 {result['emotion_sample_size']:,}개 댓글 · "
-            f"감정 채택 임계값 {result['emotion_threshold']:.2f}"
-        )
+    score_df = pd.DataFrame({
+        "항목": list(score["item_scores"].keys()),
+        "점수": list(score["item_scores"].values()),
+    }).set_index("항목")
+    st.bar_chart(score_df, y="점수", height=300)
 
-        st.info(
-            "한 댓글에 '화남/분노 + 불평/불만 + 의심/불신'처럼 여러 감정이 동시에 "
-            "검출될 수 있습니다. 따라서 아래 44개 세부 감정 비율의 합은 100%가 아닐 수 있습니다."
-        )
-
-        emotion_df = pd.DataFrame(result["emotion_distribution"])
-        if not emotion_df.empty:
-            display_emotion = emotion_df.copy()
-            display_emotion["비율(%)"] = display_emotion["비율"] * 100
-
-            top15 = display_emotion.head(15).set_index("감정")
-            st.subheader("많이 나타난 세부 감정 TOP 15")
-            st.bar_chart(top15, y="비율(%)", height=520)
-
-            with st.expander("44개 감정 전체 결과 보기"):
-                table_view = display_emotion[
-                    ["감정", "분류", "댓글 수", "비율(%)", "평균 확률"]
-                ].copy()
-                table_view["비율(%)"] = table_view["비율(%)"].round(1)
-                table_view["평균 확률"] = table_view["평균 확률"].round(3)
-                st.dataframe(
-                    table_view,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-        # ---------------- 긍정/부정/중립 ----------------
-        st.subheader("긍정 · 부정 · 중립 요약")
-
-        vd = result["valence_distribution"]
-        v1, v2, v3 = st.columns(3)
-        v1.metric("긍정", f"{vd['긍정']:.1%}")
-        v2.metric("부정", f"{vd['부정']:.1%}")
-        v3.metric("중립", f"{vd['중립']:.1%}")
-
+    d1, d2 = st.columns(2)
+    with d1:
+        st.markdown("**KOTE 긍정·부정·중립**")
         valence_df = pd.DataFrame({
             "분류": ["긍정", "부정", "중립"],
             "비율(%)": [
@@ -422,83 +405,185 @@ if analyze:
                 vd["중립"] * 100,
             ]
         }).set_index("분류")
-        st.bar_chart(valence_df, y="비율(%)", height=330)
+        st.bar_chart(valence_df, y="비율(%)", height=280)
 
-        st.caption(
-            "긍정·부정·중립은 KOTE의 세부 감정을 valence 그룹으로 묶은 요약입니다. "
-            "각 댓글에서 긍정·부정·중립 그룹별 가장 높은 감정 확률을 비교해 하나로 분류합니다."
-        )
-
-        # ---------------- 대표 감정 댓글 ----------------
-        st.subheader("세부 감정별 대표 댓글")
-        examples = result["top_emotion_examples"]
-
-        if not examples:
-            st.write("표시할 대표 감정 댓글이 없습니다.")
-        else:
-            for emotion, rows in examples.items():
-                with st.expander(f"{emotion} 대표 댓글"):
-                    for i, row in enumerate(rows, 1):
-                        st.write(
-                            f"{i}. **{row['score']:.1%}** — {row['text']}"
-                        )
-
-        # ---------------- 기존 문구/군집 결과 ----------------
-        st.divider()
-        st.header("3. 반복 문구와 AI 의미 군집")
-
-        if result["top_phrases"]:
-            st.subheader("많이 반복된 동일 문구")
-            phrase_df = pd.DataFrame(result["top_phrases"])
-            phrase_df.columns = ["댓글", "반복 횟수"]
+    with d2:
+        st.markdown("**KOTE 세부 감정 TOP 10**")
+        emo = pd.DataFrame(result["emotion_distribution"][:10])
+        if not emo.empty:
+            emo["비율(%)"] = emo["비율"] * 100
             st.dataframe(
-                phrase_df,
+                emo[["감정", "분류", "비율(%)"]].round({"비율(%)": 1}),
+                hide_index=True,
                 use_container_width=True,
-                hide_index=True
             )
-
-        st.subheader("AI가 발견한 의미가 비슷한 댓글 집단")
-        if not result["top_clusters"]:
-            st.write("현재 기준에서 뚜렷한 의미 군집이 발견되지 않았습니다.")
         else:
-            for cluster in result["top_clusters"]:
-                with st.expander(
-                    f"군집 {cluster['cluster_id']} · {cluster['size']}개 댓글"
-                ):
-                    for i, text in enumerate(cluster["examples"], 1):
-                        st.write(f"{i}. {text}")
+            st.info("KOTE 감정 분석값이 없습니다.")
+
+    st.markdown("**날짜별 댓글 수**")
+    daily = result["daily"].set_index("날짜")
+    st.line_chart(daily, y="댓글 수", height=260)
+
+    if result["top_clusters"]:
+        st.markdown("**AI 의미 군집 대표 댓글**")
+        for cluster in result["top_clusters"][:3]:
+            with st.expander(
+                f"군집 {cluster['cluster_id']} · {cluster['size']}개 댓글"
+            ):
+                for i, text in enumerate(cluster["examples"], 1):
+                    st.write(f"{i}. {text}")
+
+    single_zip = build_ppt_result_zip(result)
+    safe_title = re.sub(r"[^0-9A-Za-z가-힣_-]+", "_", result["title"]).strip("_")
+    st.download_button(
+        "📦 이 영상 PPT용 결과 다운로드",
+        data=single_zip,
+        file_name=f"{result['video_id']}_{safe_title[:35]}_PPT분석결과.zip",
+        mime="application/zip",
+        key=f"single_{result['video_id']}",
+        use_container_width=True,
+    )
 
 
-        # ---------------- 발표자료용 결과 다운로드 ----------------
-        st.divider()
-        st.header("4. 발표자료용 분석 결과 다운로드")
-        st.write(
-            "이 영상의 점수, AI 분석값, 44개 감정, 일별 댓글 수, "
-            "AI 의미 군집과 대표 댓글을 한 번에 저장할 수 있습니다."
+st.set_page_config(
+    page_title="AI 유튜브 댓글 일괄 분석",
+    page_icon="🔎",
+    layout="wide",
+)
+
+st.title("🔎 AI 유튜브 댓글 조직적 패턴 일괄 분석")
+st.caption(
+    "YouTube 주소를 여러 개 입력하면 동일한 기준으로 자동 분석하고 "
+    "영상별 120점, AI 의미 분석, KOTE 감정 결과를 한 번에 비교합니다."
+)
+
+api_key = ""
+try:
+    api_key = st.secrets.get("YOUTUBE_API_KEY", "")
+except Exception:
+    pass
+api_key = api_key or os.environ.get("YOUTUBE_API_KEY", "")
+
+if not api_key:
+    with st.sidebar:
+        st.subheader("YouTube API 설정")
+        api_key = st.text_input("YouTube API Key", type="password")
+
+st.info(
+    "URL을 한 줄에 하나씩 입력하세요. 단일 영상도 가능하며, "
+    f"한 번에 최대 {MAX_BATCH_VIDEOS}개까지 분석하도록 제한했습니다."
+)
+
+urls_text = st.text_area(
+    "분석할 YouTube 영상 주소",
+    height=220,
+    placeholder=(
+        "https://www.youtube.com/watch?v=AAAA\n"
+        "https://www.youtube.com/watch?v=BBBB\n"
+        "https://www.youtube.com/watch?v=CCCC"
+    ),
+)
+
+start = st.button(
+    "🚀 전체 영상 분석 시작",
+    type="primary",
+    use_container_width=True,
+)
+
+if start:
+    urls = [line.strip() for line in urls_text.splitlines() if line.strip()]
+
+    if not api_key:
+        st.error("YouTube API Key가 필요합니다.")
+    elif not urls:
+        st.error("분석할 YouTube 주소를 한 개 이상 입력하세요.")
+    elif len(urls) > MAX_BATCH_VIDEOS:
+        st.error(
+            f"한 번에 최대 {MAX_BATCH_VIDEOS}개까지 분석할 수 있습니다. "
+            "URL 수를 줄여주세요."
         )
+    else:
+        progress = st.progress(0.0)
+        status = st.empty()
 
-        export_zip = build_ppt_result_zip(result)
-        safe_title = re.sub(r"[^0-9A-Za-z가-힣_-]+", "_", result["title"]).strip("_")
-        safe_title = safe_title[:40] if safe_title else result["video_id"]
+        def update_progress(done, total, message):
+            ratio = min(max(done / max(total, 1), 0.0), 1.0)
+            progress.progress(ratio)
+            status.write(message)
 
-        st.download_button(
-            label="📦 PPT용 분석결과 ZIP 다운로드",
-            data=export_zip,
-            file_name=f"{result['video_id']}_{safe_title}_PPT분석결과.zip",
-            mime="application/zip",
-            type="primary",
-            use_container_width=True,
-        )
+        try:
+            batch = analyze_videos_batch(
+                urls,
+                api_key,
+                progress_callback=update_progress
+            )
+            progress.progress(1.0)
+            status.success("전체 분석이 완료되었습니다.")
 
-        st.caption(
-            "ZIP 안에는 분석요약, 120점 점수산정, KOTE 44개 감정, "
-            "긍정·부정·중립, 일별 댓글 수, 반복 문구, AI 의미 군집, "
-            "감정별 대표 댓글, PPT 발표용 요약문이 포함됩니다."
-        )
+            st.session_state["batch_results"] = batch["results"]
+            st.session_state["batch_errors"] = batch["errors"]
 
-    except Exception as e:
-        st.error(f"분석 중 오류가 발생했습니다: {e}")
-        st.caption(
-            "댓글 비활성화, 비공개 영상, API 할당량, 잘못된 API 키, "
-            "또는 배포 서버의 메모리 부족 등이 원인일 수 있습니다."
-        )
+        except Exception as e:
+            st.error(f"전체 분석 중 오류가 발생했습니다: {e}")
+
+results = st.session_state.get("batch_results", [])
+errors = st.session_state.get("batch_errors", [])
+
+if results:
+    st.divider()
+    st.header("1. 전체 영상 비교")
+
+    comp = comparison_dataframe(results)
+    st.dataframe(
+        comp,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("영상별 최종 120점 비교")
+    score_chart = comp[["영상", "최종 점수"]].copy().set_index("영상")
+    st.bar_chart(score_chart, y="최종 점수", height=430)
+
+    st.subheader("핵심 분석 지표 비교")
+    ai_chart = comp[
+        ["영상", "TF-IDF(%)", "AI 의미유사(%)", "최대 AI 군집(%)", "반복작성자(%)"]
+    ].copy().set_index("영상")
+    st.bar_chart(ai_chart, height=460)
+
+    st.subheader("KOTE 긍정 · 부정 · 중립 비교")
+    emotion_chart = comp[
+        ["영상", "긍정(%)", "부정(%)", "중립(%)"]
+    ].copy().set_index("영상")
+    st.bar_chart(emotion_chart, height=420)
+
+    st.divider()
+    st.header("2. 영상별 상세 결과")
+
+    for i, result in enumerate(results, 1):
+        with st.expander(
+            f"{i}. {result['title']} — {result['score_result']['score']}/120점",
+            expanded=(i == 1),
+        ):
+            render_video_detail(result)
+
+    st.divider()
+    st.header("3. 전체 결과 다운로드")
+
+    batch_zip = build_batch_result_zip(results, errors)
+    st.download_button(
+        "📦 전체 영상 PPT용 분석결과 ZIP 다운로드",
+        data=batch_zip,
+        file_name="youtube_batch_PPT_analysis_results.zip",
+        mime="application/zip",
+        type="primary",
+        use_container_width=True,
+    )
+
+    st.caption(
+        "전체 점수 비교, AI 지표 비교, KOTE 감정 비교와 "
+        "각 영상의 상세 CSV·대표 댓글·PPT 요약문이 한 ZIP에 들어갑니다."
+    )
+
+if errors:
+    with st.expander(f"⚠️ 분석 중 오류/경고 {len(errors)}건 보기"):
+        st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
