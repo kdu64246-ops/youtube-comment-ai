@@ -3,6 +3,8 @@ import re
 import json
 import gc
 import hashlib
+import pickle
+from datetime import datetime, timezone
 from collections import Counter
 from urllib.parse import urlparse, parse_qs
 
@@ -958,7 +960,40 @@ def _finalize_batch_result(prep, sem, emotion):
     }
 
 
-def analyze_videos_batch(urls, api_key, progress_callback=None):
+
+def save_batch_checkpoint(checkpoint_path, results, errors, complete=False, requested_urls=None):
+    """배치 결과를 세션과 무관하게 서버 파일에 저장한다."""
+    if not checkpoint_path:
+        return
+
+    directory = os.path.dirname(checkpoint_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    payload = {
+        "results": results,
+        "errors": errors,
+        "complete": bool(complete),
+        "requested_urls": list(requested_urls or []),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    temp_path = checkpoint_path + ".tmp"
+    with open(temp_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temp_path, checkpoint_path)
+
+
+def load_batch_checkpoint(checkpoint_path):
+    """저장된 최근 배치 분석 결과를 읽는다."""
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return None
+
+    with open(checkpoint_path, "rb") as f:
+        return pickle.load(f)
+
+
+def analyze_videos_batch(urls, api_key, progress_callback=None, checkpoint_path=None):
     """
     여러 영상을 한 번에 분석한다.
 
@@ -994,6 +1029,15 @@ def analyze_videos_batch(urls, api_key, progress_callback=None):
     if not clean_urls:
         return {"results": [], "errors": []}
 
+    # 새 분석을 시작하면 이전 최신 체크포인트를 초기화한다.
+    save_batch_checkpoint(
+        checkpoint_path,
+        results=[],
+        errors=[],
+        complete=False,
+        requested_urls=clean_urls,
+    )
+
     total_steps = len(clean_urls) * 3 + 2
     done = 0
 
@@ -1022,6 +1066,9 @@ def analyze_videos_batch(urls, api_key, progress_callback=None):
 
     if not prepared:
         report("분석 가능한 영상이 없습니다.")
+        save_batch_checkpoint(
+            checkpoint_path, [], errors, complete=True, requested_urls=clean_urls
+        )
         return {"results": [], "errors": errors}
 
     # 2) Ko-SRoBERTa는 한 번만 로드
@@ -1056,6 +1103,9 @@ def analyze_videos_batch(urls, api_key, progress_callback=None):
 
     if not semantic_ok:
         report("Ko-SRoBERTa 분석을 완료한 영상이 없습니다.")
+        save_batch_checkpoint(
+            checkpoint_path, [], errors, complete=True, requested_urls=clean_urls
+        )
         return {"results": [], "errors": errors}
 
     # 3) KOTE도 한 번만 로드
@@ -1100,6 +1150,17 @@ def analyze_videos_batch(urls, api_key, progress_callback=None):
             emotion,
         )
         results.append(result)
+
+        # 중요: 영상 하나가 끝날 때마다 즉시 디스크에 저장한다.
+        # 브라우저/Streamlit 세션이 끊겨도 완료된 영상 결과를 복구할 수 있다.
+        save_batch_checkpoint(
+            checkpoint_path,
+            results,
+            errors,
+            complete=False,
+            requested_urls=clean_urls,
+        )
+
         done += 1
 
         # 결과를 만든 뒤 원문 데이터프레임은 배치 메모리에서 제거 가능
@@ -1109,6 +1170,14 @@ def analyze_videos_batch(urls, api_key, progress_callback=None):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    save_batch_checkpoint(
+        checkpoint_path,
+        results,
+        errors,
+        complete=True,
+        requested_urls=clean_urls,
+    )
 
     report("전체 영상 분석 완료")
     return {"results": results, "errors": errors}

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from analyzer import analyze_videos_batch
+from analyzer import analyze_videos_batch, load_batch_checkpoint
 
 def _pct(value):
     """0~1 비율을 발표용 % 문자열로 변환."""
@@ -227,6 +227,7 @@ def build_ppt_result_zip(result):
 
 
 MAX_BATCH_VIDEOS = 10
+BATCH_CHECKPOINT = os.path.join("data", "latest_batch_results.pkl")
 
 
 def build_batch_result_zip(results, errors=None):
@@ -457,6 +458,25 @@ st.caption(
     "영상별 120점, AI 의미 분석, KOTE 감정 결과를 한 번에 비교합니다."
 )
 
+# 세션이 끊겨도 완료된 영상 결과를 복구할 수 있도록 서버 파일을 확인한다.
+saved_batch = None
+try:
+    saved_batch = load_batch_checkpoint(BATCH_CHECKPOINT)
+except Exception as e:
+    st.warning(f"저장된 분석 결과 확인 중 오류: {e}")
+
+if not st.session_state.get("batch_results") and saved_batch:
+    saved_count = len(saved_batch.get("results", []))
+    state_text = "완료" if saved_batch.get("complete") else "일부 완료"
+    st.info(
+        f"💾 저장된 최근 분석 결과가 있습니다: {saved_count}개 영상 · {state_text}\n\n"
+        f"마지막 저장 시각(UTC): {saved_batch.get('updated_at', '알 수 없음')}"
+    )
+    if st.button("🔄 최근 저장 결과 불러오기", use_container_width=True):
+        st.session_state["batch_results"] = saved_batch.get("results", [])
+        st.session_state["batch_errors"] = saved_batch.get("errors", [])
+        st.rerun()
+
 api_key = ""
 try:
     api_key = st.secrets.get("YOUTUBE_API_KEY", "")
@@ -515,7 +535,8 @@ if start:
             batch = analyze_videos_batch(
                 urls,
                 api_key,
-                progress_callback=update_progress
+                progress_callback=update_progress,
+                checkpoint_path=BATCH_CHECKPOINT,
             )
             progress.progress(1.0)
             status.success("전체 분석이 완료되었습니다.")
@@ -529,7 +550,17 @@ if start:
 results = st.session_state.get("batch_results", [])
 errors = st.session_state.get("batch_errors", [])
 
+if not results and errors:
+    st.error(
+        "분석 작업은 종료되었지만 정상적으로 완료된 영상 결과가 없습니다. "
+        "아래 오류/경고 목록에서 원인을 확인하세요."
+    )
+
 if results:
+    st.success(
+        f"✅ 복구 가능한 분석 결과 {len(results)}개가 저장되어 있습니다. "
+        "페이지가 새로고침되더라도 '최근 저장 결과 불러오기'로 다시 불러올 수 있습니다."
+    )
     st.divider()
     st.header("1. 전체 영상 비교")
 
@@ -585,5 +616,6 @@ if results:
     )
 
 if errors:
-    with st.expander(f"⚠️ 분석 중 오류/경고 {len(errors)}건 보기"):
+    st.warning(f"분석 중 오류/경고가 {len(errors)}건 있습니다.")
+    with st.expander(f"⚠️ 오류/경고 {len(errors)}건 자세히 보기", expanded=not bool(results)):
         st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
