@@ -3,7 +3,6 @@ import re
 import json
 import gc
 import hashlib
-import pickle
 from collections import Counter
 from urllib.parse import urlparse, parse_qs
 
@@ -273,27 +272,11 @@ def tfidf_duplicate_metrics(df):
             ngram_range=(2, 3)
         ).fit_transform(sample)
 
-        # 전체 3000x3000 유사도 행렬을 한 번에 만들지 않고
-        # 작은 블록으로 계산하여 Streamlit Cloud 메모리 사용을 줄인다.
-        n = tfidf.shape[0]
-        block = 256
-        max_sim = np.zeros(n, dtype=np.float32)
-
-        for start in range(0, n, block):
-            end = min(start + block, n)
-            sim_block = cosine_similarity(tfidf[start:end], tfidf)
-
-            # 자기 자신과의 유사도는 제외
-            rows = np.arange(end - start)
-            cols = np.arange(start, end)
-            sim_block[rows, cols] = 0.0
-
-            max_sim[start:end] = sim_block.max(axis=1).astype(np.float32)
-
-        near_share = float((max_sim >= TFIDF_NEAR_DUP_SIM).mean())
-
-        del tfidf, max_sim
-        gc.collect()
+        sim = cosine_similarity(tfidf)
+        np.fill_diagonal(sim, 0)
+        near_share = float(
+            (sim.max(axis=1) >= TFIDF_NEAR_DUP_SIM).mean()
+        )
 
     return {
         "exact_share": exact_share,
@@ -335,22 +318,10 @@ def semantic_ai_metrics(df):
     )
     emb = np.asarray(emb, dtype=np.float32)
 
-    # 전체 NxN 행렬을 메모리에 유지하지 않고 블록 단위로
-    # 각 댓글의 최대 의미 유사도만 계산한다.
-    n = emb.shape[0]
-    block = 256
-    max_sim = np.full(n, -1.0, dtype=np.float32)
+    sim = emb @ emb.T
+    np.fill_diagonal(sim, -1.0)
 
-    for start in range(0, n, block):
-        end = min(start + block, n)
-        sim_block = emb[start:end] @ emb.T
-
-        rows = np.arange(end - start)
-        cols = np.arange(start, end)
-        sim_block[rows, cols] = -1.0
-
-        max_sim[start:end] = sim_block.max(axis=1)
-
+    max_sim = sim.max(axis=1)
     semantic_near_share = float((max_sim >= SEMANTIC_SIM).mean())
 
     labels = DBSCAN(
@@ -393,7 +364,7 @@ def semantic_ai_metrics(df):
         })
 
     # 다음 KOTE 모델을 위해 임베딩 모델 메모리 해제
-    del model, emb, max_sim
+    del model, emb, sim
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -708,39 +679,7 @@ def organizational_score(metrics):
     }
 
 
-
-def save_single_checkpoint(path, result):
-    """단일 영상 결과를 세션과 별개로 서버 파일에 저장."""
-    if not path:
-        return
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, path)
-
-
-def load_single_checkpoint(path):
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def analyze_video(url, api_key, checkpoint_path=None, progress_callback=None):
-    """
-    안정형 단일영상 분석.
-
-    핵심 120점 결과를 KOTE보다 먼저 완성하고 체크포인트에 저장한다.
-    따라서 KOTE 감정 모델에서 오류가 나도 점수 결과와 다운로드 자료는 유지된다.
-    """
-    def report(step, message):
-        if progress_callback:
-            progress_callback(step, message)
-
-    report(0.05, "영상 정보와 댓글을 수집하는 중")
+def analyze_video(url, api_key):
     video_id = extract_video_id(url)
     youtube = get_youtube(api_key)
 
@@ -751,16 +690,17 @@ def analyze_video(url, api_key, checkpoint_path=None, progress_callback=None):
         raise ValueError("수집 가능한 댓글이 없습니다.")
 
     df = filter_analysis_comments(raw_df)
+
     if df.empty:
         raise ValueError("분석 가능한 한국어 댓글이 없습니다.")
 
-    report(0.25, "시간 패턴·TF-IDF·작성자 행동을 분석하는 중")
     time = time_metrics(df, info["upload"])
     dup = tfidf_duplicate_metrics(df)
+    sem = semantic_ai_metrics(df)
     auth = author_metrics(df)
 
-    report(0.45, "Ko-SRoBERTa로 의미 유사도와 의미 군집을 분석하는 중")
-    sem = semantic_ai_metrics(df)
+    # 기존 이진 감성분석 대신 KOTE 44개 세부 감정 분석
+    emotion = kote_emotion_metrics(df)
 
     metrics = {
         "share_48h": time["share_48h"],
@@ -775,7 +715,6 @@ def analyze_video(url, api_key, checkpoint_path=None, progress_callback=None):
         "top_author_share": auth["top_author_share"],
     }
 
-    report(0.68, "120점 조직적 댓글 패턴 점수를 계산하는 중")
     score_result = organizational_score(metrics)
 
     daily_df = pd.DataFrame({
@@ -783,8 +722,7 @@ def analyze_video(url, api_key, checkpoint_path=None, progress_callback=None):
         "댓글 수": time["daily"].values,
     })
 
-    # KOTE 전에도 완전한 핵심 결과를 만든다.
-    result = {
+    return {
         "video_id": video_id,
         "title": info["title"],
         "upload": info["upload"],
@@ -798,35 +736,10 @@ def analyze_video(url, api_key, checkpoint_path=None, progress_callback=None):
         "daily": daily_df,
         "score_result": score_result,
 
-        # KOTE는 아래에서 채운다. 실패해도 핵심 결과는 유지.
-        "emotion_sample_size": 0,
-        "emotion_threshold": KOTE_THRESHOLD,
-        "emotion_distribution": [],
-        "valence_distribution": {"긍정": 0.0, "부정": 0.0, "중립": 0.0},
-        "top_emotion_examples": {},
-        "emotion_error": None,
+        # 새 KOTE 결과
+        "emotion_sample_size": emotion["sample_size"],
+        "emotion_threshold": emotion["threshold"],
+        "emotion_distribution": emotion["emotion_distribution"],
+        "valence_distribution": emotion["valence_distribution"],
+        "top_emotion_examples": emotion["top_emotion_examples"],
     }
-
-    # 핵심 결과를 먼저 저장
-    save_single_checkpoint(checkpoint_path, result)
-
-    report(0.76, "핵심 점수 저장 완료 · KOTE 44개 감정을 분석하는 중")
-
-    try:
-        emotion = kote_emotion_metrics(df)
-        result.update({
-            "emotion_sample_size": emotion["sample_size"],
-            "emotion_threshold": emotion["threshold"],
-            "emotion_distribution": emotion["emotion_distribution"],
-            "valence_distribution": emotion["valence_distribution"],
-            "top_emotion_examples": emotion["top_emotion_examples"],
-            "emotion_error": None,
-        })
-    except Exception as e:
-        # 감정 분석은 점수에 직접 들어가지 않으므로 실패해도 결과 반환
-        result["emotion_error"] = str(e)
-
-    save_single_checkpoint(checkpoint_path, result)
-    report(1.0, "분석 완료")
-
-    return result
