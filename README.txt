@@ -42,3 +42,12 @@ GitHub에 이미 배포한 경우:
   08_감정별대표댓글.csv
   PPT_발표요약.txt
 - CSV는 Excel에서 한글이 깨지지 않도록 UTF-8 BOM으로 저장
+
+
+[단일영상 안정형 v4]
+- 분석 결과를 버튼 클릭 블록 밖에서 렌더링하도록 변경
+- data/latest_single_result.pkl에 결과 체크포인트 저장
+- Ko-SRoBERTa + 120점 결과를 KOTE 분석보다 먼저 저장
+- KOTE 분석 실패 시에도 핵심 점수/그래프/다운로드 유지
+- TF-IDF 및 Ko-SRoBERTa 유사도 행렬을 블록 계산으로 변경하여 메모리 사용 감소
+- 최근 저장 결과 불러오기 버튼 추가
